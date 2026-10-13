@@ -35,6 +35,9 @@ temp_file <- tempfile(fileext = ".xlsx")
 download.file(url_2025, destfile = temp_file, mode = "wb")
 
 govtech_raw <- read_excel(temp_file, sheet = "GTMI_Data") |>
+  # Drop fully empty columns first so clean_names() doesn't generate
+  # placeholder names like `...462`, `....463`, etc.
+  remove_empty("cols") |>
   clean_names() |> 
   # Filter only year 2025 rows
   filter(year == 2025) |>
@@ -43,7 +46,7 @@ govtech_raw <- read_excel(temp_file, sheet = "GTMI_Data") |>
 
 # Keep only country identifiers and the 9 MIS indicators from the GTMI 2025 data.
 # Each MIS has two columns:
-govtech2025 <- govtech_raw |>
+govtech_subset <- govtech_raw |>
   select(
     # Country identifiers
     country_code = code,
@@ -65,9 +68,9 @@ govtech2025 <- govtech_raw |>
     i_9,     # Human Resource and Payroll System in place
     i_9_3,   # Year HRPS was established
 
-    # Human Resource Management Information System (HRMIS)
+    # Human Resource Management Information System (PAYROLL)
     i_10,    # Human Resource Management Information System in place
-    i_10_3,  # Year HRMIS was established
+    i_10_3,  # Year PAYROLL was established
 
     # Social Safety Net Management Information System (SSNMIS)
     i_11,    # Social Safety Net Management Information System in place
@@ -97,9 +100,11 @@ country_list <- cliaretl::wb_country_list |>
   mutate(country_code = ifelse(country_code == "KOS", "XKX", country_code))
 
 # filter raw data to only include country rows based on the country list,
-# conditioning on BOTH country_code and country_name
-govtech2025_clean <- govtech2025 |>
-  semi_join(country_list, by = c("country_code", "country_name"))
+# matching on country_code only (names differ across sources).
+# Also drop NIC (Nicaragua), which is not comparable to the legacy counts.
+govtech2025_clean <- govtech_subset |>
+  filter(country_code != "NIC") |>
+  semi_join(country_list, by = "country_code")
 
 # clean data -----------------------------------------------------------
 
@@ -125,8 +130,8 @@ ims_df <- govtech2025_clean |>
     HRSS_year   = i_9_3,   # Year HRSS was established
 
     # Human Resource Management Information System
-    HRMIS       = i_10,    # Human Resource Management Information System in place
-    HRMIS_year  = i_10_3,  # Year HRMIS was established
+    PAYROLL       = i_10,    # Human Resource Management Information System in place
+    PAYROLL_year  = i_10_3,  # Year PAYROLL was established
 
     # Social Safety Net Management Information System
     SSMIS       = i_11,    # Social Safety Net Management Information System in place
@@ -152,7 +157,7 @@ ims_df_long <- ims_df |>
   #         (FMIS -> FMIS_value, alongside FMIS_year)
   rename_with(
     \(x) paste0(x, "_value"),
-    c(FMIS, TMIS, CMIS, HRSS, HRMIS, SSMIS, EPMIS, DMIS, PIMIS)
+    c(FMIS, TMIS, CMIS, HRSS, PAYROLL, SSMIS, EPMIS, DMIS, PIMIS)
   ) |>
   # Step 2: pivot once; text before "_" becomes mis_type,
   #         text after "_" ("value" or "year") becomes its own column
@@ -171,31 +176,110 @@ ims_df_long <- ims_df |>
 ims_time_series <- ims_df_long |>
   # Step 3: expand each country + MIS type across the full 1990-2025 timeline
   cross_join(tibble(year = seq(1990, 2025))) |>
-  # Step 4: an MIS is "in place" in a given year only if it exists (mis_value > 0)
-  #         and the year is at/after its establishment year.
-  #         If the establishment year is missing, treat it as present across all years.
+  # Step 4: an MIS counts as "in place" in a given year only if it is
+  #         operational (mis_value == 2). Timing rule:
+  #           - If we have a plausible establishment year (1960-2025), the system
+  #             is in place from that year onward (a pre-1990 year means it is in
+  #             place across the whole window).
+  #           - If the establishment year is missing or implausible (NA, < 1960,
+  #             or > 2025), we still know the system is operational as of 2025 but
+  #             cannot date its start, so we treat it as in place across the whole
+  #             window rather than silently dropping it to 0.
   mutate(
+    mis_known_start = !is.na(mis_year) & between(mis_year, 1960, 2025),
     mis_in_place = if_else(
-      !is.na(mis_value) & mis_value > 0 &
-        (is.na(mis_year) | year >= mis_year),
-      1, 0
+      !is.na(mis_value) & mis_value == 2 &
+        if_else(mis_known_start, year >= mis_year, TRUE),
+      2, 0 # 2 = in place, 0 = not in place
     )
   ) |>
-  # Step 5: calculate the proportion of MIS types in place for each country and year
+  # Step 5: calculate the proportion of MIS types in place for each country and year.
+  #         If ANY of the 9 systems has an unknown (NA) status, the overall
+  #         proportion is NA rather than silently treating the gap as a 0.
   group_by(country_code, country_name, year) |>
   summarize(
     total_mis = n(),                                 # number of MIS types (9)
-    mis_present = sum(mis_in_place, na.rm = TRUE),   # MIS types in place
-    mis_proportion = if_else(total_mis > 0, mis_present / total_mis, NA_real_),
+    mis_present = sum(mis_in_place == 2),            # Change to: number of MIS in place
+    any_unknown = any(is.na(mis_value)),             # any system with no data
+    mis_proportion = if_else(
+      any_unknown | total_mis == 0,
+      NA_real_,
+      mis_present / total_mis
+    ),
     .groups = "drop"
+  ) |>
+  select(-any_unknown)
+ 
+
+# quality-checks ---------------------------------------------------------
+
+# QC1. Operational (==2) systems with a missing or out-of-window establishment
+#      year. These are counted as in place across the whole 1990-2025 window
+#      (we know they exist but cannot date the start), so review them to confirm
+#      that full-window attribution is reasonable.
+qc_op_bad_year <- ims_df_long |>
+  filter(mis_value == 2) |>
+  filter(is.na(mis_year) | mis_year > 2025 | mis_year < 1960) |>
+  arrange(country_code, mis_type)
+
+# QC2. Confirm "planned" (==1) systems never land inside the 1990-2025 window,
+#      i.e. their establishment years are all in the future (or missing).
+qc_planned_in_window <- ims_df_long |>
+  filter(mis_value == 1, !is.na(mis_year), between(mis_year, 1990, 2025)) |>
+  arrange(country_code, mis_type)
+
+# QC3. Spot-check that a pre-1990 operational system is in place from 1990 on.
+#      Picks one country/system with mis_year < 1990 and shows early years.
+qc_pre1990_example <- ims_df_long |>
+  filter(mis_value == 2, !is.na(mis_year), mis_year < 1990) |>
+  slice(1) |>
+  select(country_code, mis_type, mis_year) |>
+  left_join(
+    ims_time_series |> filter(year %in% c(1990, 1991)),
+    by = "country_code"
   )
 
+# QC4. Value domain: mis_value should only ever be NA, 0, 1, or 2.
+qc_value_domain <- ims_df_long |>
+  filter(!is.na(mis_value), !mis_value %in% c(0, 1, 2)) |>
+  distinct(mis_value)
+
+# QC5. Panel completeness: every country should have exactly 36 years (1990-2025)
+#      and mis_proportion must stay within [0, 1] (or be NA).
+qc_panel_shape <- ims_time_series |>
+  group_by(country_code) |>
+  summarise(
+    n_years        = n(),
+    min_year       = min(year),
+    max_year       = max(year),
+    prop_out_range = any(!is.na(mis_proportion) &
+                           (mis_proportion < 0 | mis_proportion > 1)),
+    .groups = "drop"
+  ) |>
+  filter(n_years != 36 | min_year != 1990 | max_year != 2025 | prop_out_range)
+
+# QC6. Monotonicity: with ==2 and a fixed start year, a country's count should
+#      never decrease over time. Flag any country where it drops.
+qc_non_monotonic <- ims_time_series |>
+  arrange(country_code, year) |>
+  group_by(country_code) |>
+  filter(any(diff(mis_present) < 0, na.rm = TRUE)) |>
+  ungroup() |>
+  distinct(country_code)
+
+# Hard stops for the issues that should truly never happen
+stopifnot(
+  "mis_value has values outside {NA,0,1,2}" = nrow(qc_value_domain) == 0,
+  "planned systems fall inside 1990-2025"   = nrow(qc_planned_in_window) == 0,
+  "panel shape or proportion range invalid" = nrow(qc_panel_shape) == 0,
+  "mis_present decreases over time"         = nrow(qc_non_monotonic) == 0
+)
 
 
 # export-data ------------------------------------------------------------
 
 ims_time_series |>
-  readr::write_csv(here("raw-data", "ims_time_series.csv"))
+  readr::write_csv(here("raw-data", "ims_time_series_revised.csv"))
 
 
 

@@ -12,6 +12,7 @@ library(purrr)
 library(tidyr)
 
 
+
 # Install cliaretl package from GitHub if not already installed
 
 # Step 1. Install the packages 'pak' or 'remotes' if you don't have them:
@@ -30,7 +31,7 @@ library(cliaretl)
 # data-load ---------------------------------------------------------------
 
 # Metadata load
-dictionary <- cliaretl::db_variables_final
+dictionary <- cliaretl::db_variables
 
 # Load compiled indicators
 cliar_indicators <- fs::path_package(
@@ -43,7 +44,7 @@ country_list <- cliaretl::wb_country_list
 
 # Load the Digital data
 mis_data <- readr::read_csv(
-  here("raw-data", "ims_time_series.csv")
+  here("raw-data", "ims_time_series_revised.csv")
 ) |> 
   select(country_code, year, mis_proportion)
 
@@ -56,11 +57,6 @@ cliar_indicators_full <- cliar_indicators |>
   ) 
 
 # data preparation -------------------------------------------------------------
-
-
-
-
-
 
 
 # STEP 1. DEFINE VARIABLE SUBSETS (legacy)
@@ -140,10 +136,8 @@ cliar_indicators_rescaled <- cliar_indicators_full |>
     # Freedom House (1–7): reverse
     across(starts_with("fh_fiw"), ~ reverse_indicator(.x, min = 1, max = 7)),
     # V-DEM: flip so higher = stronger institutions
-    across(c(vdem_core_v2x_pubcorr, vdem_core_v2x_execorr, vdem_core_v2cacamps), flip_indicator)
-    # # WJP: flip so higher = stronger institutions
-    # across(starts_with("wjp_rol"), flip_indicator),
-  )
+    across(c(vdem_core_v2x_pubcorr, vdem_core_v2x_execorr, vdem_core_v2cacamps, vdem_core_v2x_corr), flip_indicator)
+    )
   
 
 # ctf-transformations ----------------------------------------------------
@@ -182,7 +176,7 @@ ctf_dynamic_time_series <-
     (unlist(time_series_vars_by_family, use.names = FALSE)),
     min_max_dynamic,
     c("country_code","year"),
-    zero_floor = 0.01)
+    zero_floor = 0.00)
 
 
 group_ctf_dynamic <-
@@ -215,37 +209,20 @@ group_ctf_dynamic <- tibble::add_column(group_ctf_dynamic,
                                 .after = "country_code")
 
 
-# ## Prepare dynamic data ----
-# # Clean CTF dynamic data and incorporate logged GDP per capita, scorecard indicators
-# ctf_dynamic <-
-#   ctf_dynamic |>
-#   # add country codes and names
-#   left_join(
-#     country_list |> distinct(country_code, country_name),
-#     by = "country_code"
-#   ) |>
-#   # add gdp per capita (PPP) data
-#   left_join(
-#     cliar_indicators |> select(country_code, year, wdi_nygdppcapppkd),
-#     by = c("country_code", "year")
-#   ) |>
-#   # add scorecard indicators
-#   left_join(
-#     cliar_indicators |> select(country_code, year, starts_with("wb_csc_")),
-#     by = c("country_code", "year")
-#   ) |> 
-#   # rename and transform gdp per capita to log
-#   mutate(
-#     log_gdp = log(wdi_nygdppcapppkd)
-#   ) |>
-#   bind_rows(group_ctf_dynamic) |>
-#   ungroup() |>
-#   arrange(country_name) |>
-#   select(
-#     country_code,
-#     country_name,
-#     everything()
-#   )
+## Prepare dynamic data ----
+# Clean CTF dynamic data and incorporate logged GDP per capita, scorecard indicators
+ctf_dynamic <-
+  ctf_dynamic |>
+  # add country codes and names
+  left_join(
+    country_list |> distinct(country_code, country_name),
+    by = "country_code"
+  ) |>
+  select(
+    country_code,
+    country_name,
+    everything()
+  )
 
 ctf_dynamic_long <-
   ctf_dynamic |>
@@ -308,28 +285,138 @@ ctf_dynamic_family <-
     values_to = "value"
   ) |>
   left_join(family_lookup, by = "variable") |>
-  group_by(country_code, country_group, year, family) |>
-  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") |>
-  # mean() over an all-NA family returns NaN; turn those back into NA
-  mutate(value = if_else(is.nan(value), NA_real_, value)) |>
+  group_by(country_code, country_group, year, family) |> 
+  # Following Legacy calculations:
+  # A family score is now only calculated when every indicator in that family is present.
+  # If any indicator is missing, the score is NA. 
+  summarise(
+    n_total = n(),                 # number of indicators in the family
+    n_valid = sum(!is.na(value)),  # number of non-missing indicators
+    value   = if (n_valid == n_total) mean(value) else NA_real_,
+    .groups = "drop"
+  ) |>
+  select(-n_total, -n_valid) |>
   pivot_wider(
     names_from = family,
     values_from = value,
     names_glue = "{family}_avg"
   ) |>
   # drop 2026
-  filter(year <= 2025)
+  filter(year <= 2025) |> 
+  # # drop country_group variable
+  # select(-country_group) |>
+  # add country names
+  left_join(
+    country_list |> distinct(country_code, country_name),
+    by = "country_code"
+  ) 
+
+# Check for duplicates
+family_lookup |> count(variable) |> filter(n > 1) # It should be empty
 
 
+# Rename columns to match legacy output
+ctf_dynamic_family_export <- ctf_dynamic_family |>
+  rename(
+    `Political Institutions`           = vars_pol_avg,
+    `Social Institutions`              = vars_social_avg,
+    `Corruption (lack of)`             = vars_anticorruption_avg,
+    `Transparency Institutions`        = vars_transp_avg,
+    `Justice Institutions`             = vars_leg_avg,
+    `Public HR Institutions`           = vars_hrm_avg,
+    `Public Finance Institutions`      = vars_pfm_avg,
+    `Digital Institutions`             = vars_digital_avg,
+    `Climate Change Institutions`      = vars_climate_avg
+  )
+  
 
 
 # Export-data ------------------------------------------------------------
 
-write_rds(
-  ctf_dynamic_family,
-  here("output-data", "CLIAR_fams_2026.rds")
+
+write_excel_csv(
+  ctf_dynamic_family_export,
+  here("output", "CLIAR_ts_benchmarking_10132026.csv")
 )
 
 
+# corr plot (optional) ----------------------------------------------------
 
+legacy_panel <- readxl::read_xlsx(
+  here("raw-data", "legacy_aggregates_2025.xlsx")
+) 
+
+# create a correlation plot between legacy_panel and ctf_dynamic_family as
+# a check to see if the calculations are consistent
+
+# map legacy family columns -> dynamic *_avg columns
+family_crosswalk <- tibble::tribble(
+  ~legacy_col,            ~family,
+  "Political Inst.",      "vars_pol_avg",
+  "Social Inst.",         "vars_social_avg",
+  "Corruption (lack of)", "vars_anticorruption_avg",
+  "Transparency Inst.",   "vars_transp_avg",
+  "Justice Inst.",        "vars_leg_avg",
+  "Public_HR_Inst",       "vars_hrm_avg",
+  "Public_Finance_Inst",  "vars_pfm_avg",
+  "Digital_Inst",         "vars_digital_avg",
+  "Climate Change Inst.", "vars_climate_avg"
+)
+
+# legacy -> long
+legacy_long <-
+  legacy_panel |>
+  pivot_longer(
+    -c(country_code, country_name, year),
+    names_to = "legacy_col",
+    values_to = "legacy_value"
+  ) |>
+  left_join(family_crosswalk, by = "legacy_col") |>
+  select(country_code, year, family, legacy_value)
+
+# dynamic (country level only) -> long
+dynamic_long <-
+  ctf_dynamic_family |>
+  filter(country_group == 0) |>
+  pivot_longer(
+    ends_with("_avg"),
+    names_to = "family",
+    values_to = "new_value"
+  ) |>
+  select(country_code, year, family, new_value)
+
+# join and keep rows where both are present
+compare_families <-
+  inner_join(legacy_long, dynamic_long, by = c("country_code", "year", "family")) |>
+  filter(!is.na(legacy_value), !is.na(new_value))
+
+# per-family correlation labels
+family_cor <-
+  compare_families |>
+  group_by(family) |>
+  summarise(
+    r = cor(legacy_value, new_value),
+    label = paste0("r = ", round(r, 3)),
+    .groups = "drop"
+  )
+
+
+library(ggplot2)
+
+# faceted scatter: legacy vs new, with 45-degree reference line
+ggplot(compare_families, aes(legacy_value, new_value)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey60", linetype = "dashed") +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_text(
+    data = family_cor,
+    aes(x = -Inf, y = Inf, label = label),
+    hjust = -0.1, vjust = 1.3, size = 3, inherit.aes = FALSE
+  ) +
+  facet_wrap(~family, scales = "free") +
+  labs(
+    title = "Legacy vs. dynamic CTF family scores",
+    subtitle = "Dashed line = perfect agreement (y = x) - final Digital revised",
+    x = "Legacy aggregate",
+    y = "Dynamic CTF family average"
+  )
   
