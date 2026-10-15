@@ -304,8 +304,6 @@ ctf_dynamic_family <-
   ) |>
   # drop 2026
   filter(year <= 2025) |> 
-  # # drop country_group variable
-  # select(-country_group) |>
   # add country names
   left_join(
     country_list |> distinct(country_code, country_name),
@@ -328,7 +326,19 @@ ctf_dynamic_family_export <- ctf_dynamic_family |>
     `Public Finance Institutions`      = vars_pfm_avg,
     `Digital Institutions`             = vars_digital_avg,
     `Climate Change Institutions`      = vars_climate_avg
-  )
+  ) |> # Reorder
+  select(
+    country_code, country_name, year,
+    `Political Institutions`,
+    `Social Institutions`,
+    `Corruption (lack of)`,
+    `Transparency Institutions`,
+    `Justice Institutions`,
+    `Public HR Institutions`,
+    `Public Finance Institutions`,
+    `Digital Institutions`,
+    `Climate Change Institutions`
+  ) 
   
 
 
