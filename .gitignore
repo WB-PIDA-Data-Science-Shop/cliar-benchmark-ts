@@ -7,5 +7,4 @@ renv/staging/
 .RData
 .Ruserdata
 *.Rproj.user
-output/*
 !output/.gitkeep
