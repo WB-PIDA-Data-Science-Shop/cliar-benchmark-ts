@@ -129,8 +129,9 @@ var_lists$vars_dynamic_ctf <- time_series_vars_by_family
 
 # data-rescale -----------------------------------------------------------
 
-
 # Rescale indicators and compute CTF for the dynamic set
+# Note: For more details on the the rescaling functions cliaretl::rescale_indicator() and cliaretl::compute_ctf() 
+# visit the cliaretl package documentation: https://wb-pida-data-science-shop.github.io/cliaretl/
 cliar_indicators_rescaled <- cliar_indicators_full |>
   mutate(
     # Freedom House (1–7): reverse
